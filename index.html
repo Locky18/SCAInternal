@@ -410,8 +410,7 @@ try {
     toast: null,
     pendingRoleForPin: null,
     err: null,
-    gcalToken: null,
-    gcalTokenClient: null,
+    gcalConnected: false,
     editingBooking: null,
     editingJobLog: null,
     adjustingRequestId: null,
@@ -644,6 +643,8 @@ try {
       clearSessionLocal();
     }
 
+    await refreshGcalStatus();
+
     state.loading = false;
     render();
   }
@@ -686,37 +687,63 @@ try {
     else render();
   }
 
-  // ---------- GOOGLE CALENDAR ----------
+  // ---------- GOOGLE CALENDAR (via Cloud Functions backend) ----------
+
+  var GCAL_FUNCTIONS_BASE = 'https://us-central1-sca-internal-6914b.cloudfunctions.net';
 
   function gcalReady(){
     return !!(state.config.gcalClientId && window.google && window.google.accounts);
   }
 
+  async function refreshGcalStatus(){
+    try{
+      var res = await fetch(GCAL_FUNCTIONS_BASE + '/calendarStatus');
+      var data = await res.json();
+      state.gcalConnected = !!data.connected;
+    } catch(e){ /* leave as-is if the check itself fails */ }
+  }
+
   function connectGoogleCalendar(onDone){
     if(!gcalReady()){ showToast('Add a Google Client ID in Settings first'); return; }
     try{
-      state.gcalTokenClient = window.google.accounts.oauth2.initTokenClient({
+      var codeClient = window.google.accounts.oauth2.initCodeClient({
         client_id: state.config.gcalClientId,
         scope: 'https://www.googleapis.com/auth/calendar.events',
-        callback: function(resp){
-          if(resp && resp.access_token){
-            state.gcalToken = resp.access_token;
-            showToast('Google Calendar connected');
-            render();
-            if(onDone) onDone();
-          } else {
-            showToast('Google sign-in was cancelled');
+        ux_mode: 'popup',
+        callback: async function(resp){
+          if(!resp || !resp.code){ showToast('Google sign-in was cancelled'); return; }
+          try{
+            var res = await fetch(GCAL_FUNCTIONS_BASE + '/exchangeCode', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                code: resp.code,
+                client_id: state.config.gcalClientId,
+                redirect_uri: 'postmessage'
+              })
+            });
+            var data = await res.json();
+            if(data.ok){
+              state.gcalConnected = true;
+              showToast('Google Calendar connected — this will stay connected from now on');
+              render();
+              if(onDone) onDone();
+            } else {
+              showToast('Connection failed — check the Cloud Function is deployed correctly');
+            }
+          } catch(e){
+            showToast('Could not reach the calendar backend');
           }
         }
       });
-      state.gcalTokenClient.requestAccessToken();
+      codeClient.requestCode();
     } catch(e){
       showToast('Google sign-in failed to start');
     }
   }
 
   async function pushToGoogleCalendar(booking){
-    if(!state.gcalToken) return null;
+    if(!state.gcalConnected) return null;
     var startISO, endISO;
     try{
       var start = new Date(booking.date + 'T' + booking.time + ':00');
@@ -726,6 +753,7 @@ try {
     } catch(e){ return null; }
 
     var body = {
+      client_id: state.config.gcalClientId,
       summary: booking.customerName + ' — ' + booking.itemNote,
       location: booking.address,
       description: (booking.phone ? 'Phone: ' + booking.phone + '\n' : '') +
@@ -733,22 +761,22 @@ try {
         (booking.keyType ? 'Immobiliser type: ' + booking.keyType + '\n' : '') +
         (booking.quotedPrice != null ? 'Quoted price: £' + Number(booking.quotedPrice).toFixed(2) + ' +VAT (£' + exToInc(booking.quotedPrice).toFixed(2) + ' inc VAT)' + (booking.quotedUnit ? ' ' + booking.quotedUnit : '') + '\n' : '') +
         (booking.notes || ''),
-      start: { dateTime: startISO },
-      end: { dateTime: endISO }
+      start: startISO,
+      end: endISO
     };
 
     try{
-      var res = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+      var res = await fetch(GCAL_FUNCTIONS_BASE + '/createCalendarEvent', {
         method: 'POST',
-        headers: {
-          'Authorization': 'Bearer ' + state.gcalToken,
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
-      if(!res.ok) return null;
       var data = await res.json();
-      return data.id || null;
+      if(!res.ok || !data.ok){
+        if(data && data.error === 'not_connected'){ state.gcalConnected = false; }
+        return null;
+      }
+      return data.eventId || null;
     } catch(e){
       return null;
     }
@@ -1407,9 +1435,9 @@ try {
         '<button class="btn btn-ghost" style="margin-top:8px;" data-action="newUser">+ Add a user</button>' +
         '<div class="divider-label">Google Calendar</div>' +
         '<div class="banner">' +
-          '<div class="d">' + (state.gcalToken ? 'Connected for this session — bookings you save will be added to your calendar.' : 'Not connected yet. Add a Client ID above, save, then connect below. This only works once the app is hosted at the address registered with Google — it won\'t connect from a preview link.') + '</div>' +
+          '<div class="d">' + (state.gcalConnected ? 'Connected — this stays connected permanently now, no need to reconnect after a refresh.' : 'Not connected yet. Add a Client ID above, save, then connect below.') + '</div>' +
         '</div>' +
-        '<button class="btn btn-ghost" data-action="connectGcal">' + (state.gcalToken ? 'Reconnect Google Calendar' : 'Connect Google Calendar') + '</button>' +
+        '<button class="btn btn-ghost" data-action="connectGcal">' + (state.gcalConnected ? 'Reconnect Google Calendar' : 'Connect Google Calendar') + '</button>' +
         '<div class="divider-label">Sessions</div>' +
         '<div class="banner"><div class="d">Everyone stays signed in on their device until they tap Sign out, or you force everyone (including yourself) back to the login screen from here — useful if a phone is lost or someone leaves.</div></div>' +
         (state.confirmLogoutEveryone ? (
@@ -1467,15 +1495,26 @@ try {
     var rows = upcoming.map(function(b){
       var dt = new Date(b.date + 'T' + (b.time||'00:00'));
       var vehicle = [b.vehicleYear, b.vehicleMake, b.vehicleModel].filter(Boolean).join(' ');
+      var jobStatus = b.status || 'scheduled';
+      var statusLabel = jobStatus === 'completed' ? 'Completed' : (jobStatus === 'partial' ? 'Partially done' : '');
+      var statusClass = jobStatus === 'completed' ? 'status-answered' : (jobStatus === 'partial' ? 'status-pending' : '');
+      var statusActions = jobStatus === 'scheduled'
+        ? ('<button class="btn btn-ghost" data-action="setBookingStatus" data-status="completed" data-id="' + b.id + '">Mark completed</button>' +
+           '<button class="btn btn-ghost" data-action="setBookingStatus" data-status="partial" data-id="' + b.id + '">Mark partial</button>')
+        : ('<button class="btn btn-ghost" data-action="setBookingStatus" data-status="scheduled" data-id="' + b.id + '">Reopen</button>');
       return '<div class="req-card">' +
         '<div class="top">' +
           '<div class="item">' + esc(b.customerName) + '</div>' +
-          '<div class="status-pill ' + (b.calendarEventId ? 'status-answered' : 'status-pending') + '">' + (b.calendarEventId ? 'On calendar' : 'Not synced') + '</div>' +
+          '<div style="display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end;">' +
+            (statusLabel ? '<div class="status-pill ' + statusClass + '">' + statusLabel + '</div>' : '') +
+            '<div class="status-pill ' + (b.calendarEventId ? 'status-answered' : 'status-pending') + '">' + (b.calendarEventId ? 'On calendar' : 'Not synced') + '</div>' +
+          '</div>' +
         '</div>' +
         '<div class="note">' + esc(b.itemNote) + (b.quotedPrice != null ? ' — £' + Number(b.quotedPrice).toFixed(2) + ' +VAT' : '') + (b.address ? ' · ' + esc(b.address) : '') + '</div>' +
         (vehicle || b.regNumber ? '<div class="note">' + esc(vehicle) + (b.regNumber ? (vehicle ? ' · ' : '') + esc(b.regNumber.toUpperCase()) : '') + (b.keyType ? ' · ' + esc(b.keyType) + ' immobiliser' : '') + '</div>' : (b.keyType ? '<div class="note">' + esc(b.keyType) + ' immobiliser</div>' : '')) +
         '<div class="meta">' + dt.toLocaleDateString([], {weekday:'short', month:'short', day:'numeric'}) + ' at ' + esc(b.time) + (b.phone ? ' · ' + esc(b.phone) : '') + '</div>' +
-        '<div class="btn-row" style="margin-top:12px;">' +
+        '<div class="btn-row" style="margin-top:12px;">' + statusActions + '</div>' +
+        '<div class="btn-row" style="margin-top:8px;">' +
           '<button class="btn btn-ghost" data-action="editBooking" data-id="' + b.id + '">Edit</button>' +
           '<button class="btn btn-danger" data-action="deleteBooking" data-id="' + b.id + '">Cancel job</button>' +
         '</div>' +
@@ -1491,8 +1530,9 @@ try {
   }
 
   function viewBookingForm(){
-    var b = state.editingBooking || { customerName:'', phone:'', address:'', regNumber:'', itemNote:'', date:'', time:'', notes:'', vehicleMake:'', vehicleModel:'', vehicleYear:'', keyType:'' };
+    var b = state.editingBooking || { customerName:'', phone:'', address:'', addressLine1:'', postcode:'', town:'', county:'', regNumber:'', itemNote:'', date:'', time:'', notes:'', vehicleMake:'', vehicleModel:'', vehicleYear:'', keyType:'' };
     var fromQuote = b.quotedPrice != null && !isNaN(b.quotedPrice);
+    var addrLine1 = b.addressLine1 || (b.town || b.postcode ? '' : (b.address || ''));
     return (
       '<div class="content">' +
         (fromQuote ? (
@@ -1503,7 +1543,14 @@ try {
         ) : '') +
         '<div class="field"><label>Customer name</label><input type="text" id="bName" value="' + esc(b.customerName) + '" /></div>' +
         '<div class="field"><label>Phone (optional)</label><input type="text" id="bPhone" value="' + esc(b.phone||'') + '" /></div>' +
-        '<div class="field"><label>Job address</label><input type="text" id="bAddress" value="' + esc(b.address||'') + '" placeholder="Where the job is" /></div>' +
+        '<div class="btn-row">' +
+          '<div class="field" style="flex:1;"><label>Postcode</label><input type="text" id="bPostcode" value="' + esc(b.postcode||'') + '" placeholder="e.g. PO1 3AX" style="text-transform:uppercase;" /></div>' +
+          '<button class="btn btn-ghost" style="flex:0 0 auto; align-self:flex-end; margin-bottom:16px;" data-action="lookupPostcode">Look up</button>' +
+        '</div>' +
+        '<div id="bPostcodeInfo" class="unit" style="margin:-10px 0 14px;">' + (b.town || b.county ? '&#10003; ' + esc([b.town, b.county].filter(Boolean).join(', ')) : '') + '</div>' +
+        '<input type="hidden" id="bTown" value="' + esc(b.town||'') + '" />' +
+        '<input type="hidden" id="bCounty" value="' + esc(b.county||'') + '" />' +
+        '<div class="field"><label>House number &amp; street</label><input type="text" id="bAddressLine1" value="' + esc(addrLine1) + '" placeholder="e.g. 14 Elm Road" /></div>' +
         '<div class="field"><label>Registration (optional)</label><input type="text" id="bReg" value="' + esc(b.regNumber||'') + '" placeholder="e.g. AB12 CDE" style="text-transform:uppercase;" /></div>' +
         '<div class="field"><label>Job / item</label><input type="text" id="bItem" value="' + esc(b.itemNote) + '" placeholder="e.g. Replace outdoor tap" /></div>' +
         '<div class="btn-row">' +
@@ -1511,7 +1558,7 @@ try {
           '<div class="field" style="flex:1;"><label>Time</label><input type="time" id="bTime" value="' + esc(b.time) + '" /></div>' +
         '</div>' +
         '<div class="field"><label>Notes (optional)</label><textarea id="bNotes">' + esc(b.notes||'') + '</textarea></div>' +
-        (!state.gcalToken ? '<div class="banner"><div class="d">Google Calendar isn\'t connected this session, so this booking will be saved here but won\'t appear on your calendar until someone connects it from Settings and saves it again.</div></div>' : '') +
+        (!state.gcalConnected ? '<div class="banner"><div class="d">Google Calendar isn\'t connected, so this booking will be saved here but won\'t appear on your calendar. Connect it from Settings first if you want that.</div></div>' : '') +
         '<div class="divider-label">Vehicle (optional)</div>' +
         '<div class="btn-row">' +
           '<div class="field" style="flex:1;"><label>Make</label>' + makeSelectHtml('bMake', b.vehicleMake) + '</div>' +
@@ -1536,6 +1583,7 @@ try {
         '<div class="bottom-bar">' +
           '<button class="tab-btn ' + (state.view==='staffHome'?'active':'') + '" data-action="goto" data-view="staffHome"><div class="dot">&#128269;</div>Prices</button>' +
           '<button class="tab-btn ' + (state.view==='requests'?'active':'') + '" data-action="goto" data-view="requests"><div class="dot">&#128203;</div>My requests</button>' +
+          '<button class="tab-btn ' + (state.view==='bookings'?'active':'') + '" data-action="goto" data-view="bookings"><div class="dot">&#128197;</div>Bookings</button>' +
           '<button class="tab-btn" data-action="logout"><div class="dot">&#8592;</div>Sign out</button>' +
         '</div>'
       );
@@ -1714,6 +1762,7 @@ try {
         date:'', time:'', notes:'',
         vehicleMake: vctx.make || '', vehicleModel: vctx.model || '', vehicleYear: vctx.year || '', keyType: vctx.keyType || ''
       };
+      state.bookingReturnView = 'staffHome';
       state.view = 'newBooking';
       render();
     }
@@ -1952,18 +2001,58 @@ try {
     }
     else if(action === 'newBooking'){
       state.editingBooking = null;
+      state.bookingReturnView = 'bookings';
       state.view = 'newBooking';
       render();
+    }
+    else if(action === 'lookupPostcode'){
+      var pc = (document.getElementById('bPostcode')||{}).value.trim();
+      var infoEl = document.getElementById('bPostcodeInfo');
+      if(!pc){ showToast('Enter a postcode first'); return; }
+      if(infoEl) infoEl.textContent = 'Looking up…';
+      try{
+        var res = await fetch('https://api.postcodes.io/postcodes/' + encodeURIComponent(pc));
+        var data = await res.json();
+        if(data.status === 200 && data.result){
+          var town = data.result.admin_district || data.result.parish || '';
+          var county = data.result.admin_county || data.result.region || '';
+          var townEl = document.getElementById('bTown');
+          var countyEl = document.getElementById('bCounty');
+          if(townEl) townEl.value = town;
+          if(countyEl) countyEl.value = county;
+          if(infoEl) infoEl.innerHTML = '&#10003; ' + esc([town, county].filter(Boolean).join(', '));
+          var pcInput = document.getElementById('bPostcode');
+          if(pcInput) pcInput.value = data.result.postcode;
+        } else {
+          if(infoEl) infoEl.textContent = 'Postcode not recognised — check it and try again';
+        }
+      } catch(e){
+        if(infoEl) infoEl.textContent = 'Lookup failed — check your connection and try again';
+      }
+    }
+    else if(action === 'setBookingStatus'){
+      var sbId = elm.getAttribute('data-id');
+      var sbStatus = elm.getAttribute('data-status');
+      var sbBooking = state.bookings.find(function(b){ return b.id === sbId; });
+      if(sbBooking){
+        sbBooking.status = sbStatus;
+        sbBooking.statusChangedBy = state.session.name;
+        sbBooking.statusChangedAt = Date.now();
+        await persistBookings();
+        render();
+        showToast(sbStatus === 'completed' ? 'Marked completed' : (sbStatus === 'partial' ? 'Marked partially done' : 'Reopened'));
+      }
     }
     else if(action === 'editBooking'){
       var bid = elm.getAttribute('data-id');
       state.editingBooking = state.bookings.find(function(b){ return b.id === bid; });
+      state.bookingReturnView = 'bookings';
       state.view = 'editBooking';
       render();
     }
     else if(action === 'cancelBookingForm'){
       state.editingBooking = null;
-      state.view = state.session.role === 'admin' ? 'bookings' : 'staffHome';
+      state.view = state.bookingReturnView || (state.session.role === 'admin' ? 'bookings' : 'staffHome');
       render();
     }
     else if(action === 'deleteBooking'){
@@ -1976,7 +2065,11 @@ try {
     else if(action === 'saveBooking'){
       var custName = (document.getElementById('bName')||{}).value.trim();
       var phone = (document.getElementById('bPhone')||{}).value.trim();
-      var address = (document.getElementById('bAddress')||{}).value.trim();
+      var addressLine1 = (document.getElementById('bAddressLine1')||{}).value.trim();
+      var postcode = (document.getElementById('bPostcode')||{}).value.trim();
+      var town = (document.getElementById('bTown')||{}).value.trim();
+      var county = (document.getElementById('bCounty')||{}).value.trim();
+      var address = [addressLine1, postcode ? postcode.toUpperCase() : '', town, county].filter(Boolean).join(', ');
       var regNumber = (document.getElementById('bReg')||{}).value.trim();
       var itemNote = (document.getElementById('bItem')||{}).value.trim();
       var date = (document.getElementById('bDate')||{}).value;
@@ -1999,6 +2092,10 @@ try {
         booking = { id: uid(), createdAt: Date.now() };
         state.bookings.push(booking);
       }
+      booking.addressLine1 = addressLine1;
+      booking.postcode = postcode;
+      booking.town = town;
+      booking.county = county;
       booking.customerName = custName;
       booking.phone = phone;
       booking.address = address;
@@ -2015,7 +2112,7 @@ try {
 
       await persistBookings();
 
-      if(state.gcalToken){
+      if(state.gcalConnected){
         var evId = await pushToGoogleCalendar(booking);
         if(evId){ booking.calendarEventId = evId; await persistBookings(); showToast('Booked and added to calendar'); }
         else { showToast('Booked, but calendar sync failed'); }
@@ -2023,7 +2120,7 @@ try {
         showToast('Booking saved — it\'ll sync to the calendar once Google Calendar is connected');
       }
       state.editingBooking = null;
-      state.view = state.session.role === 'admin' ? 'bookings' : 'staffHome';
+      state.view = state.bookingReturnView || (state.session.role === 'admin' ? 'bookings' : 'staffHome');
       render();
     }
   }
