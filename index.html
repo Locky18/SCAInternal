@@ -376,6 +376,7 @@
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-app.js";
 import { getFirestore, doc, getDoc, setDoc } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-firestore.js";
+import { getMessaging, getToken, onMessage } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-messaging.js";
 
 const firebaseConfig = {
   apiKey: "AIzaSyBvT3l8qsRNa7rdo69DsQXF6HGrGUwnug0",
@@ -388,9 +389,11 @@ const firebaseConfig = {
 };
 
 var fbDb = null;
+var fbMessaging = null;
 try {
   var fbApp = initializeApp(firebaseConfig);
   fbDb = getFirestore(fbApp);
+  try { fbMessaging = getMessaging(fbApp); } catch(e) { console.error('Messaging init failed', e); }
 } catch(e) {
   console.error('Firebase init failed', e);
 }
@@ -400,7 +403,7 @@ try {
     loading: true,
     session: null, // {role:'staff'|'admin', name}
     view: 'login',
-    config: { businessName: 'SCA Internal', adminPin: '1234', staffPin: '0000', gcalClientId: '', vatRate: 20, forceLogoutAt: 0, users: [] },
+    config: { businessName: 'SCA Internal', adminPin: '1234', staffPin: '0000', gcalClientId: '', vatRate: 20, forceLogoutAt: 0, users: [], vapidKey: '' },
     prices: [],
     requests: [],
     bookings: [],
@@ -693,6 +696,31 @@ try {
 
   function gcalReady(){
     return !!(state.config.gcalClientId && window.google && window.google.accounts);
+  }
+
+  // ---------- PUSH NOTIFICATIONS ----------
+
+  async function enablePushNotifications(){
+    if(!fbMessaging){ showToast('Push notifications are not available in this browser'); return; }
+    if(!state.config.vapidKey){ showToast('Ask admin to add the VAPID key in Settings first'); return; }
+    try{
+      var perm = await Notification.requestPermission();
+      if(perm !== 'granted'){ showToast('Notifications permission was not granted'); return; }
+      var reg = await navigator.serviceWorker.register('./firebase-messaging-sw.js');
+      var token = await getToken(fbMessaging, { vapidKey: state.config.vapidKey, serviceWorkerRegistration: reg });
+      if(!token){ showToast('Could not get a notification token'); return; }
+      await setDoc(doc(fbDb, 'pushTokens', token), {
+        token: token,
+        name: state.session.name,
+        role: state.session.role,
+        updatedAt: Date.now()
+      });
+      state.pushEnabled = true;
+      render();
+      showToast('Push notifications turned on');
+    } catch(e){
+      showToast('Could not turn on push notifications');
+    }
   }
 
   async function refreshGcalStatus(){
@@ -1411,6 +1439,21 @@ try {
   }
 
   function viewSettings(){
+    if(state.session.role !== 'admin'){
+      return (
+        '<div class="content">' +
+          '<div class="banner"><div class="d">This is a limited settings view. Only admin can change business settings, PINs, or user accounts.</div></div>' +
+          '<div class="divider-label">Google Calendar</div>' +
+          '<div class="banner">' +
+            '<div class="d">' + (state.gcalConnected ? 'Connected — bookings you save will be added to the shared calendar automatically.' : 'Not connected. Ask an admin to connect it from their Settings first.') + '</div>' +
+          '</div>' +
+          '<button class="btn btn-ghost" data-action="refreshGcalStatus">Check connection status</button>' +
+          '<div class="divider-label">Notifications</div>' +
+          '<div class="banner"><div class="d">' + (state.pushEnabled ? 'Push notifications are on for this device.' : 'Turn on push notifications so you\'re alerted even when the app is closed.') + '</div></div>' +
+          '<button class="btn btn-ghost" data-action="enablePush">' + (state.pushEnabled ? 'Notifications are on' : 'Enable push notifications') + '</button>' +
+        '</div>'
+      );
+    }
     var c = state.config;
     var users = (c.users || []).slice().sort(function(a,b){ return a.role===b.role ? a.name.localeCompare(b.name) : (a.role==='admin'?-1:1); });
     var userRows = users.map(function(u){
@@ -1428,6 +1471,7 @@ try {
         '<div class="field"><label>Business name</label><input type="text" id="setName" value="' + esc(c.businessName) + '" /></div>' +
         '<div class="field"><label>VAT rate (%)</label><input type="number" step="0.1" id="setVatRate" value="' + esc(c.vatRate != null ? c.vatRate : 20) + '" /></div>' +
         '<div class="field"><label>Google OAuth Client ID (for calendar sync)</label><input type="text" id="setGcalId" value="' + esc(c.gcalClientId||'') + '" placeholder="xxxx.apps.googleusercontent.com" /></div>' +
+        '<div class="field"><label>Push notification VAPID key</label><input type="text" id="setVapidKey" value="' + esc(c.vapidKey||'') + '" placeholder="from Firebase Cloud Messaging settings" /></div>' +
         '<button class="btn btn-primary" data-action="saveSettings">Save settings</button>' +
         '<div class="divider-label">Users &amp; PINs</div>' +
         '<div class="banner"><div class="d">Each person signs in with their own PIN, and requests are tracked against their name automatically. Add one entry per person.</div></div>' +
@@ -1438,6 +1482,9 @@ try {
           '<div class="d">' + (state.gcalConnected ? 'Connected — this stays connected permanently now, no need to reconnect after a refresh.' : 'Not connected yet. Add a Client ID above, save, then connect below.') + '</div>' +
         '</div>' +
         '<button class="btn btn-ghost" data-action="connectGcal">' + (state.gcalConnected ? 'Reconnect Google Calendar' : 'Connect Google Calendar') + '</button>' +
+        '<div class="divider-label">Notifications</div>' +
+        '<div class="banner"><div class="d">' + (state.pushEnabled ? 'Push notifications are on for this device.' : 'Turn on push notifications so you\'re alerted even when the app is closed.') + '</div></div>' +
+        '<button class="btn btn-ghost" data-action="enablePush">' + (state.pushEnabled ? 'Notifications are on' : 'Enable push notifications') + '</button>' +
         '<div class="divider-label">Sessions</div>' +
         '<div class="banner"><div class="d">Everyone stays signed in on their device until they tap Sign out, or you force everyone (including yourself) back to the login screen from here — useful if a phone is lost or someone leaves.</div></div>' +
         (state.confirmLogoutEveryone ? (
@@ -1584,6 +1631,7 @@ try {
           '<button class="tab-btn ' + (state.view==='staffHome'?'active':'') + '" data-action="goto" data-view="staffHome"><div class="dot">&#128269;</div>Prices</button>' +
           '<button class="tab-btn ' + (state.view==='requests'?'active':'') + '" data-action="goto" data-view="requests"><div class="dot">&#128203;</div>My requests</button>' +
           '<button class="tab-btn ' + (state.view==='bookings'?'active':'') + '" data-action="goto" data-view="bookings"><div class="dot">&#128197;</div>Bookings</button>' +
+          '<button class="tab-btn ' + (state.view==='settings'?'active':'') + '" data-action="goto" data-view="settings"><div class="dot">&#9881;</div>Settings</button>' +
           '<button class="tab-btn" data-action="logout"><div class="dot">&#8592;</div>Sign out</button>' +
         '</div>'
       );
@@ -1644,6 +1692,7 @@ try {
         (state.session ? (
           '<div style="display:flex; gap:8px;">' +
             '<button class="icon-btn" data-action="manualRefresh" title="Refresh now">&#8635;</button>' +
+            '<button class="icon-btn" data-action="refreshGcalStatus" title="Check Google Calendar connection" style="' + (state.gcalConnected ? 'color:var(--green); border-color:var(--green);' : '') + '">&#128197;</button>' +
             '<button class="icon-btn ' + (notifCount ? 'badge' : '') + '" data-count="' + notifCount + '" data-action="notifBell" title="Notifications" style="' + (notifCount ? 'color:var(--amber); border-color:var(--amber);' : '') + '">&#128276;</button>' +
           '</div>'
         ) : '') +
@@ -1731,6 +1780,14 @@ try {
     }
     else if(action === 'manualRefresh'){
       await refreshFromServer(true);
+    }
+    else if(action === 'refreshGcalStatus'){
+      await refreshGcalStatus();
+      render();
+      showToast(state.gcalConnected ? 'Google Calendar is connected' : 'Google Calendar is not connected');
+    }
+    else if(action === 'enablePush'){
+      await enablePushNotifications();
     }
     else if(action === 'notifBell'){
       if(state.session.role === 'admin'){ state.view = 'adminDashboard'; }
@@ -1948,6 +2005,7 @@ try {
       var vatVal = parseFloat((document.getElementById('setVatRate')||{}).value);
       state.config.vatRate = isNaN(vatVal) ? state.config.vatRate : vatVal;
       state.config.gcalClientId = (document.getElementById('setGcalId')||{}).value.trim();
+      state.config.vapidKey = (document.getElementById('setVapidKey')||{}).value.trim();
       await persistConfig();
       render();
       showToast('Settings saved');
@@ -2130,6 +2188,15 @@ try {
   document.addEventListener('visibilitychange', function(){
     if(document.visibilityState === 'visible') refreshFromServer();
   });
+  if(fbMessaging){
+    try{
+      onMessage(fbMessaging, function(payload){
+        var title = (payload.notification && payload.notification.title) || 'Notification';
+        var body = (payload.notification && payload.notification.body) || '';
+        showToast(title + (body ? ': ' + body : ''));
+      });
+    } catch(e){ /* ignore if not supported */ }
+  }
 })();
 </script>
 </body>
