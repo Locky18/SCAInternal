@@ -2,7 +2,7 @@
   "name": "SCA Internal",
   "short_name": "SCA Internal",
   "description": "South Coast Autolocks internal pricing, requests and booking tool",
-  "start_url": "./price-quote-app.html",
+  "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
